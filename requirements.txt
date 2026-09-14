@@ -1,0 +1,6 @@
+# 实测环境：Python 3.13 / Windows 11
+# 实测版本：chromadb 1.5.9 · openai 3.13.0 · python-dotenv 1.2.3
+
+chromadb>=1.5.9        # 本地向量库（mini-agent 的 requirements 漏了它，新克隆装完跑不了建索引，这里补上）
+openai>=1.50.0         # OpenAI 兼容接口：LLM 对话和 embedding 向量化都走它
+python-dotenv>=1.0.0   # 读 .env，让 key 不进代码、不进 git

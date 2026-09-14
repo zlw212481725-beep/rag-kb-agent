@@ -1,0 +1,23 @@
+# 密钥：永远不入库（换电脑照 .env.example 重填）
+.env
+
+# 向量库：体积大，且能用 build_index.py 一键重建，不入库
+chroma_db/
+
+# 运行产物（回答、trace、eval 报告）
+output/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# PyCharm 项目配置
+.idea/
+
+# 本地学习练习册，不入库（learn_basics / learn_rag / 以后新写的都算）
+learn_*.py
+
+# 交接包：含本机路径与用户协作偏好，不进公开仓库
+HANDOFF.md
