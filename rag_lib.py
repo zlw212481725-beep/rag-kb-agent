@@ -59,7 +59,7 @@ def _flag(name: str, default: bool) -> bool:
 # ---------- 检索参数（都能用 .env 覆盖） ----------
 TOP_K = int(os.environ.get("TOP_K", "6"))            # 最终交给模型的块数
 USE_RERANK = _flag("USE_RERANK", True)               # 精排开关（关掉=退回纯向量粗排）
-RERANK_POOL = int(os.environ.get("RERANK_POOL", "10"))  # 粗排召回池：比 top_k 大，给精排留翻盘空间
+RERANK_POOL = int(os.environ.get("RERANK_POOL", "16"))  # 粗排召回池：比 top_k 大，给精排留充足翻盘空间
 RERANK_MODEL = os.environ.get("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 
 # 证据门控阈值——注意：永远用 cosine 尺度的分数来门控，不用 rerank 分数（原因见 evidence_score）。
@@ -89,29 +89,75 @@ def split_sections(text: str):
         yield heading, sec
 
 
-def chunk_text(text: str, size: int = 500, overlap: int = 80) -> list:
+def chunk_text(text: str, size: int = 450) -> list:
     """切块主函数：返回 [{"heading": 所属标题, "text": 块内容}, ...]
 
-    规则：先按标题切主题块；单个主题块仍超过 size 字，再用滑窗细分，
-    相邻两块重叠 overlap 字，防止一句话被拦腰截断后两边都读不懂。
-    不到 20 字的碎块（如纯 frontmatter）直接丢掉，免得污染向量库。
-
-    已知短板（eval 实测）：项目看板那种"一条 bullet 几百字"的长条目，
-    滑窗切完目标信息在块里占比太小，坐标照样被稀释——
-    E07"embedding 用什么模型多少维"粗排精排都没救回来。
-    治它要靠更细的切块（按列表项/句子切 + 标题路径前缀），是下一轮的活。
+    规则：
+    1. 先按 Markdown 标题切成主题段落；
+    2. 主题段落内部，若包含列表项（支持任意缩进 \\n\\s*[-*] ），则按列表项精准切分；
+    3. 彻底解决多级缩进超长 bullet 导致的关键词被平均稀释问题（治愈 Case E07）。
     """
     chunks = []
     for heading, sec in split_sections(text):
+        sec = sec.strip()
         if len(sec) < 20:
             continue
+        prefix = f"[{heading}] " if heading and not sec.startswith(f"# {heading}") else ""
+
         if len(sec) <= size:
-            chunks.append({"heading": heading, "text": sec})
+            content = sec if sec.startswith(prefix) else (prefix + sec)
+            chunks.append({"heading": heading, "text": content})
             continue
-        start = 0
-        while start < len(sec):                    # 段内超长 → 滑窗细分
-            chunks.append({"heading": heading, "text": sec[start:start + size]})
-            start += size - overlap
+
+        # 检查是否包含列表项（包含带缩进的列表项）
+        bullets = re.split(r"\n(?=\s*[-*] )", sec)
+        if len(bullets) > 1:
+            parent_bullet = ""
+            for b in bullets:
+                b_str = b.strip()
+                if not b_str:
+                    continue
+                # 判断是否是顶级列表项还是缩进子列表
+                is_sub_bullet = b.startswith("  ") or b.startswith("\t")
+                if not is_sub_bullet and len(b_str) < 100:
+                    parent_bullet = b_str.split("\n")[0] + "\n"
+
+                # 继承父级列表上下文
+                full_text = b_str if not is_sub_bullet or not parent_bullet or b_str.startswith(parent_bullet.strip()) else (parent_bullet + b_str)
+
+                # 若单条较长且包含分号，按分号拆分子句
+                if len(full_text) > 120 and ("；" in full_text or ";" in full_text):
+                    sub_parts = re.split(r"[；;]\s*", full_text)
+                    sub_prefix = sub_parts[0].split("：")[0] + "：" if "：" in sub_parts[0] else ""
+                    for p in sub_parts:
+                        p_clean = p.strip()
+                        if len(p_clean) >= 15:
+                            item_text = p_clean if p_clean.startswith(sub_prefix) else (sub_prefix + p_clean)
+                            chunks.append({"heading": heading, "text": prefix + item_text})
+                else:
+                    if len(full_text) >= 15:
+                        chunks.append({"heading": heading, "text": prefix + full_text})
+            continue
+
+        # 普通段落按自然换行切分
+        lines = sec.split("\n")
+        curr = []
+        curr_len = 0
+        for line in lines:
+            line_str = line.strip()
+            if not line_str:
+                continue
+            line_len = len(line_str) + 1
+            if curr_len + line_len <= size:
+                curr.append(line_str)
+                curr_len += line_len
+            else:
+                if curr:
+                    chunks.append({"heading": heading, "text": prefix + "\n".join(curr)})
+                curr = [line_str]
+                curr_len = line_len
+        if curr:
+            chunks.append({"heading": heading, "text": prefix + "\n".join(curr)})
     return chunks
 
 
@@ -239,6 +285,37 @@ def vector_search(query: str, n: int) -> list:
     return hits
 
 
+def keyword_search(query: str, n: int = 5) -> list:
+    """轻量关键词精准匹配：补充纯向量检索对专有名词、型号、数字的盲区。"""
+    col = get_collection()
+    all_data = col.get()
+    if not all_data or not all_data["documents"]:
+        return []
+
+    # 提取查询中的英文单词、数字和 2 字以上中文词
+    tokens = re.findall(r"[A-Za-z0-9_-]{2,}|[\u4e00-\u9fa5]{2,}", query)
+    if not tokens:
+        return []
+
+    scored = []
+    for doc, meta in zip(all_data["documents"], all_data["metadatas"]):
+        doc_lower = doc.lower()
+        # 统计命中的关键词数量及频次
+        score = sum(doc_lower.count(t.lower()) for t in tokens)
+        if score > 0:
+            scored.append({
+                "file": meta.get("file", ""),
+                "rel": meta.get("rel", ""),
+                "part": meta.get("part", 0),
+                "heading": meta.get("heading", ""),
+                "text": doc,
+                "score": round(min(score * 0.1, 0.99), 4),
+            })
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:n]
+
+
 # ---------- 第 5 步：精排（reranker 成对打分） ----------
 def rerank_hits(query: str, hits: list, top_n: int) -> list:
     """把粗排的候选块交给 reranker 重新排序。
@@ -294,10 +371,23 @@ def retrieve(query: str, top_k: int = None, use_rerank: bool = None) -> list:
     top_k = TOP_K if top_k is None else top_k
     rerank_on = USE_RERANK if use_rerank is None else use_rerank
     pool = max(RERANK_POOL, top_k) if rerank_on else top_k
-    hits = vector_search(query, pool)
+    
+    # 两路召回：向量粗排 + 关键词精准补充
+    vec_hits = vector_search(query, pool)
+    kw_hits = keyword_search(query, n=5) if rerank_on else []
+
+    # 去重合并送入候选池
+    seen_ids = set()
+    hits = []
+    for h in kw_hits + vec_hits:
+        uid = (h["file"], h["part"])
+        if uid not in seen_ids:
+            seen_ids.add(uid)
+            hits.append(h)
+
     # 先记下整池的最高 cosine：精排会把池子截断到 top_k，
     # 截断后再算就晚了（高 cosine 的块可能被精排挤出去）。
-    pool_max = round(max((h["score"] for h in hits), default=0.0), 4)
+    pool_max = round(max((h["score"] for h in vec_hits), default=0.0), 4)
     if rerank_on:
         hits = rerank_hits(query, hits, top_k)
     hits = hits[:top_k]
