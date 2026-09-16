@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from rag_lib import semantic_search, NOTES_DIR, TOP_K
+from db import db_manager
 
 # Windows 控制台默认 GBK 码页，下面的 🎯 🔧 💬 会抛 UnicodeEncodeError，先切 UTF-8
 # stdin 也要切：否则管道/重定向传入的中文会被当 GBK 解码而变成乱码
@@ -247,6 +248,7 @@ def run_turn(history: list, goal: str, turn: int, evidence_pool: list) -> str:
     实测模型引用的 训练计划.md 从头到尾没被任何一轮检索到，累积了也还是被揪出来。
     """
     print(f"\n🎯 [第{turn}轮] {goal}")
+    t_start = time.time()
     messages = history + [{"role": "user", "content": goal}]
     trace_records = []
     OUTPUT_DIR.mkdir(exist_ok=True)
@@ -274,6 +276,22 @@ def run_turn(history: list, goal: str, turn: int, evidence_pool: list) -> str:
                 "bad_citations": bad,
             })
             dump_trace(trace_records)
+
+            # 持久化写入数据库审计表 (MySQL / SQLite 双模)
+            latency_ms = int((time.time() - t_start) * 1000)
+            db_manager.log_qa_audit(
+                question=goal,
+                matched_chunks=[{"content": ev[:150]} for ev in evidence_pool],
+                max_cosine=0.0,   # 单轮追问兜底
+                max_rerank=0.0,
+                gate_decision="ACCEPT" if not bad else "WEAK",
+                has_bad_citation=bool(bad),
+                bad_citations_detail=bad,
+                response_text=answer,
+                latency_ms=latency_ms,
+                session_id=f"session_turn_{turn}",
+            )
+
             # 只有问答对进长期记忆，中间脚手架不进
             history.append({"role": "user", "content": goal})
             history.append({"role": "assistant", "content": answer})

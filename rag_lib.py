@@ -39,6 +39,8 @@ import chromadb
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from db import db_manager
+
 load_dotenv()
 
 NOTES_DIR = Path(os.environ.get("NOTES_DIR", "./notes"))
@@ -150,14 +152,31 @@ def list_note_files() -> list:
     return [md for md in NOTES_DIR.rglob("*.md") if ".obsidian" not in md.parts]
 
 
-def build_index():
-    """把整个知识库切块、向量化、入库。跑一次即可；笔记大改后重跑（upsert 幂等）。"""
+def build_index(force_rebuild: bool = False):
+    """
+    把知识库切块、向量化、入库。
+    加入 MySQL / 数据库增量索引治理：
+    通过计算文件 SHA256 哈希比对，仅对有改动的文件进行向量化，未改动文件直接秒级跳过。
+    若 force_rebuild=True 则强制对全库重新建索引。
+    """
     col = get_collection()
     ec = get_embed_client()
     files = list_note_files()
-    print(f"开始建索引：{len(files)} 个文件")
-    total = 0
+    print(f"开始建索引：知识库共有 {len(files)} 个文档")
+    indexed_count = 0
+    skipped_count = 0
+    total_chunks = 0
+
     for md in files:
+        rel = md.relative_to(NOTES_DIR)
+        rel_str = str(rel).replace("\\", "/")
+        current_hash = db_manager.calc_file_hash(md)
+
+        # 增量检测：文件未发生任何修改且非强制重建时跳过
+        if not force_rebuild and not db_manager.check_need_reindex(rel_str, current_hash):
+            skipped_count += 1
+            continue
+
         try:
             text = md.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
@@ -165,23 +184,38 @@ def build_index():
         pieces = chunk_text(text)
         if not pieces:
             continue
+
         vectors = embed_texts([p["text"] for p in pieces], ec)
-        rel = md.relative_to(NOTES_DIR)
         col.upsert(                                # upsert：有则覆盖，无则新增（重复跑不炸）
             ids=[f"{rel}#{i}" for i in range(len(pieces))],
             embeddings=vectors,
             documents=[p["text"] for p in pieces],
             metadatas=[{
                 "file": md.name,
-                "rel": str(rel).replace("\\", "/"),
+                "rel": rel_str,
                 "part": i,
                 "heading": p["heading"],
             } for i, p in enumerate(pieces)],
         )
-        total += len(pieces)
-        print(f"  {md.name}: {len(pieces)} 块")
-    print(f"索引完成：共 {total} 块，存放在 {CHROMA_DIR}")
-    return total
+        total_chunks += len(pieces)
+        indexed_count += 1
+        print(f"  [索引更新] {md.name}: 新切块 {len(pieces)} 块")
+
+        # 将文档最新元数据与哈希更新入库
+        file_size = md.stat().st_size
+        category = rel.parts[0] if len(rel.parts) > 1 else "root"
+        db_manager.upsert_document(
+            doc_id=rel_str,
+            title=md.stem,
+            category=category,
+            file_path=str(md.resolve()),
+            file_hash=current_hash,
+            chunk_count=len(pieces),
+            file_size=file_size,
+        )
+
+    print(f"索引构建完成：更新 {indexed_count} 个文档，跳过 {skipped_count} 个未改动文档，本次处理 {total_chunks} 块，数据库当前存有 {col.count()} 块。")
+    return total_chunks
 
 
 # ---------- 第 4 步：粗排（纯向量召回） ----------
